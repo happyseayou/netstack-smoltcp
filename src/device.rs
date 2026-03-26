@@ -1,8 +1,3 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-
 use smoltcp::{
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
     time::Instant,
@@ -12,26 +7,30 @@ use tokio::sync::mpsc::{unbounded_channel, Permit, Sender, UnboundedReceiver, Un
 use crate::packet::AnyIpPktFrame;
 
 pub(super) struct VirtualDevice {
-    in_buf_avail: Arc<AtomicBool>,
     in_buf: UnboundedReceiver<Vec<u8>>,
+    pending_in_buf: Option<Vec<u8>>,
     out_buf: Sender<AnyIpPktFrame>,
 }
 
 impl VirtualDevice {
-    pub(super) fn new(
-        iface_egress_tx: Sender<AnyIpPktFrame>,
-    ) -> (Self, UnboundedSender<Vec<u8>>, Arc<AtomicBool>) {
-        let iface_ingress_tx_avail = Arc::new(AtomicBool::new(false));
+    pub(super) fn new(iface_egress_tx: Sender<AnyIpPktFrame>) -> (Self, UnboundedSender<Vec<u8>>) {
         let (iface_ingress_tx, iface_ingress_rx) = unbounded_channel();
         (
             Self {
-                in_buf_avail: iface_ingress_tx_avail.clone(),
                 in_buf: iface_ingress_rx,
+                pending_in_buf: None,
                 out_buf: iface_egress_tx,
             },
             iface_ingress_tx,
-            iface_ingress_tx_avail,
         )
+    }
+
+    pub(super) fn has_pending_ingress(&self) -> bool {
+        self.pending_in_buf.is_some() || !self.in_buf.is_empty()
+    }
+
+    pub(super) fn egress_capacity(&self) -> usize {
+        self.out_buf.capacity()
     }
 }
 
@@ -40,14 +39,18 @@ impl Device for VirtualDevice {
     type TxToken<'a> = VirtualTxToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let Ok(buffer) = self.in_buf.try_recv() else {
-            self.in_buf_avail.store(false, Ordering::Release);
-            return None;
+        let buffer = match self.pending_in_buf.take() {
+            Some(buffer) => buffer,
+            None => self.in_buf.try_recv().ok()?,
         };
 
-        let Ok(permit) = self.out_buf.try_reserve() else {
-            self.in_buf_avail.store(false, Ordering::Release);
-            return None;
+        let permit = match self.out_buf.try_reserve() {
+            Ok(permit) => permit,
+            Err(_) => {
+                // Hold on to the ingress packet and retry later instead of dropping it.
+                self.pending_in_buf = Some(buffer);
+                return None;
+            }
         };
 
         Some((Self::RxToken { buffer }, Self::TxToken { permit }))
@@ -94,5 +97,34 @@ impl<'a> TxToken for VirtualTxToken<'a> {
         let result = f(&mut buffer);
         self.permit.send(buffer);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn receive_keeps_ingress_packet_when_egress_is_full() {
+        let (stack_tx, mut stack_rx) = tokio::sync::mpsc::channel(1);
+        stack_tx.send(vec![9, 9, 9]).await.unwrap();
+
+        let (mut device, iface_ingress_tx) = VirtualDevice::new(stack_tx);
+        iface_ingress_tx.send(vec![1, 2, 3]).unwrap();
+
+        assert!(device.has_pending_ingress());
+        assert!(device.receive(Instant::ZERO).is_none());
+        assert!(device.has_pending_ingress());
+
+        assert_eq!(stack_rx.recv().await.unwrap(), vec![9, 9, 9]);
+
+        let (rx_token, tx_token) = device.receive(Instant::ZERO).expect("pending packet");
+        let mut rx_buf = Vec::new();
+        rx_token.consume(|buffer| rx_buf.extend_from_slice(buffer));
+        assert_eq!(rx_buf, vec![1, 2, 3]);
+
+        tx_token.consume(2, |buffer| buffer.copy_from_slice(&[4, 5]));
+        assert_eq!(stack_rx.recv().await.unwrap(), vec![4, 5]);
+        assert!(!device.has_pending_ingress());
     }
 }

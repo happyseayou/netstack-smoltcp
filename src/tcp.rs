@@ -2,10 +2,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     pin::Pin,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::Arc,
     task::{Context, Poll, Waker},
 };
 
@@ -34,9 +31,11 @@ use crate::{
     Runner,
 };
 
-// NOTE: Default buffer could contain 20 AEAD packets
-const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = 0x3FFF * 20;
-const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 0x3FFF * 20;
+// Keep the per-stream proxy buffers modest so TUN-mode backpressure reaches the
+// local sender earlier instead of letting large bursts queue inside the userspace stack.
+const DEFAULT_TCP_SEND_BUFFER_SIZE: usize = 64 * 1024;
+const DEFAULT_TCP_RECV_BUFFER_SIZE: usize = 64 * 1024;
+const EGRESS_BACKPRESSURE_WAIT: std::time::Duration = std::time::Duration::from_millis(1);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum TcpSocketState {
@@ -70,7 +69,6 @@ impl TcpListenerRunner {
         device: VirtualDevice,
         iface: Interface,
         iface_ingress_tx: UnboundedSender<Vec<u8>>,
-        iface_ingress_tx_avail: Arc<AtomicBool>,
         tcp_rx: Receiver<AnyIpPktFrame>,
         stream_tx: UnboundedSender<TcpStream>,
         sockets: HashMap<SocketHandle, SharedControl>,
@@ -79,8 +77,8 @@ impl TcpListenerRunner {
             let notify = Arc::new(Notify::new());
             let (socket_tx, socket_rx) = unbounded_channel::<TcpSocketCreation>();
             let res = tokio::select! {
-                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx) => v,
-                v = Self::handle_socket(notify, device, iface, iface_ingress_tx_avail, sockets, socket_rx) => v,
+                v = Self::handle_packet(notify.clone(), iface_ingress_tx, tcp_rx, stream_tx, socket_tx) => v,
+                v = Self::handle_socket(notify, device, iface, sockets, socket_rx) => v,
             };
             res?;
             trace!("VirtDevice::poll thread exited");
@@ -91,7 +89,6 @@ impl TcpListenerRunner {
     async fn handle_packet(
         notify: SharedNotify,
         iface_ingress_tx: UnboundedSender<Vec<u8>>,
-        iface_ingress_tx_avail: Arc<AtomicBool>,
         mut tcp_rx: Receiver<AnyIpPktFrame>,
         stream_tx: UnboundedSender<TcpStream>,
         socket_tx: UnboundedSender<TcpSocketCreation>,
@@ -110,7 +107,6 @@ impl TcpListenerRunner {
                 iface_ingress_tx
                     .send(frame)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
-                iface_ingress_tx_avail.store(true, Ordering::Release);
                 notify.notify_one();
                 continue;
             }
@@ -135,8 +131,8 @@ impl TcpListenerRunner {
             // TCP first handshake packet, create a new Connection
             if packet.syn() && !packet.ack() {
                 let mut socket = TcpSocket::new(
-                    TcpSocketBuffer::new(vec![0u8; DEFAULT_TCP_RECV_BUFFER_SIZE as usize]),
-                    TcpSocketBuffer::new(vec![0u8; DEFAULT_TCP_SEND_BUFFER_SIZE as usize]),
+                    TcpSocketBuffer::new(vec![0u8; DEFAULT_TCP_RECV_BUFFER_SIZE]),
+                    TcpSocketBuffer::new(vec![0u8; DEFAULT_TCP_SEND_BUFFER_SIZE]),
                 );
                 socket.set_keep_alive(Some(Duration::from_secs(28)));
                 // FIXME: It should follow system's setting. 7200 is Linux's default.
@@ -152,9 +148,9 @@ impl TcpListenerRunner {
                 trace!("created TCP connection for {} <-> {}", src_addr, dst_addr);
 
                 let control = Arc::new(SpinMutex::new(TcpSocketControl {
-                    send_buffer: RingBuffer::new(vec![0u8; DEFAULT_TCP_SEND_BUFFER_SIZE as usize]),
+                    send_buffer: RingBuffer::new(vec![0u8; DEFAULT_TCP_SEND_BUFFER_SIZE]),
                     send_waker: None,
-                    recv_buffer: RingBuffer::new(vec![0u8; DEFAULT_TCP_RECV_BUFFER_SIZE as usize]),
+                    recv_buffer: RingBuffer::new(vec![0u8; DEFAULT_TCP_RECV_BUFFER_SIZE]),
                     recv_waker: None,
                     recv_state: TcpSocketState::Normal,
                     send_state: TcpSocketState::Normal,
@@ -177,7 +173,6 @@ impl TcpListenerRunner {
             iface_ingress_tx
                 .send(frame)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
-            iface_ingress_tx_avail.store(true, Ordering::Release);
             notify.notify_one();
         }
         Ok(())
@@ -187,7 +182,6 @@ impl TcpListenerRunner {
         notify: SharedNotify,
         mut device: VirtualDevice,
         mut iface: Interface,
-        iface_ingress_tx_avail: Arc<AtomicBool>,
         mut sockets: HashMap<SocketHandle, SharedControl>,
         mut socket_rx: UnboundedReceiver<TcpSocketCreation>,
     ) -> std::io::Result<()> {
@@ -336,7 +330,17 @@ impl TcpListenerRunner {
                 socket_set.remove(socket_handle);
             }
 
-            if !iface_ingress_tx_avail.load(Ordering::Acquire) {
+            let pending_ingress = device.has_pending_ingress();
+            let egress_blocked = device.egress_capacity() == 0;
+
+            if pending_ingress {
+                if egress_blocked {
+                    let _ = tokio::time::timeout(EGRESS_BACKPRESSURE_WAIT, notify.notified()).await;
+                }
+                continue;
+            }
+
+            {
                 let next_duration = iface
                     .poll_delay(before_poll, &socket_set)
                     .unwrap_or(Duration::from_millis(5));
@@ -346,6 +350,8 @@ impl TcpListenerRunner {
                         notify.notified(),
                     )
                     .await;
+                } else if egress_blocked {
+                    let _ = tokio::time::timeout(EGRESS_BACKPRESSURE_WAIT, notify.notified()).await;
                 }
             }
         }
@@ -361,7 +367,7 @@ impl TcpListener {
         tcp_rx: Receiver<AnyIpPktFrame>,
         stack_tx: Sender<AnyIpPktFrame>,
     ) -> std::io::Result<(Runner, Self)> {
-        let (mut device, iface_ingress_tx, iface_ingress_tx_avail) = VirtualDevice::new(stack_tx);
+        let (mut device, iface_ingress_tx) = VirtualDevice::new(stack_tx);
         let iface = Self::create_interface(&mut device)?;
 
         let (stream_tx, stream_rx) = unbounded_channel();
@@ -370,7 +376,6 @@ impl TcpListener {
             device,
             iface,
             iface_ingress_tx,
-            iface_ingress_tx_avail,
             tcp_rx,
             stream_tx,
             HashMap::new(),
