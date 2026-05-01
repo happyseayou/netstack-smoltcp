@@ -21,6 +21,7 @@ pub struct StackBuilder {
     enable_udp: bool,
     enable_tcp: bool,
     enable_icmp: bool,
+    mtu: usize,
     stack_buffer_size: usize,
     udp_buffer_size: usize,
     tcp_buffer_size: usize,
@@ -33,6 +34,7 @@ impl Default for StackBuilder {
             enable_udp: false,
             enable_tcp: false,
             enable_icmp: false,
+            mtu: 1504,
             stack_buffer_size: 1024,
             udp_buffer_size: 512,
             tcp_buffer_size: 512,
@@ -55,6 +57,11 @@ impl StackBuilder {
 
     pub fn enable_icmp(mut self, enable: bool) -> Self {
         self.enable_icmp = enable;
+        self
+    }
+
+    pub fn mtu(mut self, mtu: usize) -> Self {
+        self.mtu = mtu;
         self
     }
 
@@ -131,7 +138,7 @@ impl StackBuilder {
         let udp_socket = udp_rx.map(|udp_rx| UdpSocket::new(udp_rx, stack_tx.clone()));
 
         let (tcp_runner, tcp_listener) = if let Some(tcp_rx) = tcp_rx {
-            let (tcp_runner, tcp_listener) = TcpListener::new(tcp_rx, stack_tx)?;
+            let (tcp_runner, tcp_listener) = TcpListener::new(tcp_rx, stack_tx, self.mtu)?;
             (Some(tcp_runner), Some(tcp_listener))
         } else {
             (None, None)

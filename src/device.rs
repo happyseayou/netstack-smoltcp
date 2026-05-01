@@ -10,16 +10,21 @@ pub(super) struct VirtualDevice {
     in_buf: UnboundedReceiver<Vec<u8>>,
     pending_in_buf: Option<Vec<u8>>,
     out_buf: Sender<AnyIpPktFrame>,
+    mtu: usize,
 }
 
 impl VirtualDevice {
-    pub(super) fn new(iface_egress_tx: Sender<AnyIpPktFrame>) -> (Self, UnboundedSender<Vec<u8>>) {
+    pub(super) fn new(
+        iface_egress_tx: Sender<AnyIpPktFrame>,
+        mtu: usize,
+    ) -> (Self, UnboundedSender<Vec<u8>>) {
         let (iface_ingress_tx, iface_ingress_rx) = unbounded_channel();
         (
             Self {
                 in_buf: iface_ingress_rx,
                 pending_in_buf: None,
                 out_buf: iface_egress_tx,
+                mtu,
             },
             iface_ingress_tx,
         )
@@ -66,7 +71,7 @@ impl Device for VirtualDevice {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut capabilities = DeviceCapabilities::default();
         capabilities.medium = Medium::Ip;
-        capabilities.max_transmission_unit = 1504;
+        capabilities.max_transmission_unit = self.mtu;
         capabilities
     }
 }
@@ -109,7 +114,7 @@ mod tests {
         let (stack_tx, mut stack_rx) = tokio::sync::mpsc::channel(1);
         stack_tx.send(vec![9, 9, 9]).await.unwrap();
 
-        let (mut device, iface_ingress_tx) = VirtualDevice::new(stack_tx);
+        let (mut device, iface_ingress_tx) = VirtualDevice::new(stack_tx, 1504);
         iface_ingress_tx.send(vec![1, 2, 3]).unwrap();
 
         assert!(device.has_pending_ingress());
@@ -126,5 +131,12 @@ mod tests {
         tx_token.consume(2, |buffer| buffer.copy_from_slice(&[4, 5]));
         assert_eq!(stack_rx.recv().await.unwrap(), vec![4, 5]);
         assert!(!device.has_pending_ingress());
+    }
+
+    #[test]
+    fn capabilities_report_configured_mtu() {
+        let (stack_tx, _stack_rx) = tokio::sync::mpsc::channel(1);
+        let (device, _iface_ingress_tx) = VirtualDevice::new(stack_tx, 1380);
+        assert_eq!(device.capabilities().max_transmission_unit, 1380);
     }
 }
