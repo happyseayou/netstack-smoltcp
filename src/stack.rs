@@ -6,7 +6,8 @@ use std::{
 
 use futures::{Sink, Stream};
 use smoltcp::wire::IpProtocol;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{channel, Receiver};
+use tokio_util::sync::PollSender;
 use tracing::{debug, trace};
 
 use crate::{
@@ -148,9 +149,9 @@ impl StackBuilder {
             ip_filters: self.ip_filters,
             stack_rx,
             sink_buf: None,
-            udp_tx,
-            tcp_tx,
-            icmp_tx,
+            udp_tx: udp_tx.map(PollSender::new),
+            tcp_tx: tcp_tx.map(PollSender::new),
+            icmp_tx: icmp_tx.map(PollSender::new),
         };
 
         Ok((stack, tcp_runner, udp_socket, tcp_listener))
@@ -160,44 +161,43 @@ impl StackBuilder {
 pub struct Stack {
     ip_filters: IpFilters<'static>,
     sink_buf: Option<(AnyIpPktFrame, IpProtocol)>,
-    udp_tx: Option<Sender<AnyIpPktFrame>>,
-    tcp_tx: Option<Sender<AnyIpPktFrame>>,
-    icmp_tx: Option<Sender<AnyIpPktFrame>>,
+    udp_tx: Option<PollSender<AnyIpPktFrame>>,
+    tcp_tx: Option<PollSender<AnyIpPktFrame>>,
+    icmp_tx: Option<PollSender<AnyIpPktFrame>>,
     stack_rx: Receiver<AnyIpPktFrame>,
 }
 
 impl Stack {
-    fn poll_send(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+    fn poll_send(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
         let (item, proto) = match self.sink_buf.take() {
             Some(val) => val,
             None => return Poll::Ready(Ok(())),
         };
 
-        let ready_res = match proto {
-            IpProtocol::Tcp => self.tcp_tx.as_mut().map(|tx| tx.try_reserve()),
-            IpProtocol::Udp => self.udp_tx.as_mut().map(|tx| tx.try_reserve()),
-            IpProtocol::Icmp | IpProtocol::Icmpv6 => {
-                self.icmp_tx.as_mut().map(|tx| tx.try_reserve())
-            }
+        let sender = match proto {
+            IpProtocol::Tcp => self.tcp_tx.as_mut(),
+            IpProtocol::Udp => self.udp_tx.as_mut(),
+            IpProtocol::Icmp | IpProtocol::Icmpv6 => self.icmp_tx.as_mut(),
             _ => unreachable!(),
         };
 
-        let Some(ready_res) = ready_res else {
+        let Some(sender) = sender else {
             return Poll::Ready(Ok(()));
         };
 
-        let permit = match ready_res {
-            Ok(permit) => permit,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+        match sender.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(_)) => return Poll::Ready(Err(channel_closed_err("channel is closed"))),
+            Poll::Pending => {
                 self.sink_buf.replace((item, proto));
                 return Poll::Pending;
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                return Poll::Ready(Err(channel_closed_err("channel is closed")));
-            }
-        };
+        }
 
-        permit.send(item);
+        if sender.send_item(item).is_err() {
+            return Poll::Ready(Err(channel_closed_err("channel is closed")));
+        }
+
         Poll::Ready(Ok(()))
     }
 }
@@ -219,11 +219,11 @@ impl Stream for Stack {
 impl Sink<AnyIpPktFrame> for Stack {
     type Error = std::io::Error;
 
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        if self.sink_buf.is_none() {
-            Poll::Ready(Ok(()))
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        if self.sink_buf.is_some() {
+            self.poll_send(cx)
         } else {
-            Poll::Pending
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -276,4 +276,73 @@ where
     E: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     std::io::Error::new(std::io::ErrorKind::BrokenPipe, err)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+        time::Duration,
+    };
+
+    use etherparse::PacketBuilder;
+    use futures::{SinkExt, StreamExt};
+    use tokio::time::{sleep, timeout};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn stack_sink_wakes_after_protocol_channel_has_capacity() {
+        let (stack, _runner, udp_socket, _tcp_listener) = StackBuilder::default()
+            .enable_udp(true)
+            .udp_buffer_size(1)
+            .build()
+            .expect("build stack");
+        let udp_socket = udp_socket.expect("udp socket");
+        let (mut stack_sink, _stack_stream) = stack.split();
+        let (mut udp_read, _udp_write) = udp_socket.split();
+
+        let local = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 1111));
+        let remote = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 2222));
+        let first = udp_ipv4_packet(local, remote, b"first");
+        let second = udp_ipv4_packet(local, remote, b"second");
+
+        stack_sink.send(first).await.expect("first packet");
+        let second_send = tokio::spawn(async move { stack_sink.send(second).await });
+
+        sleep(Duration::from_millis(50)).await;
+        assert!(
+            !second_send.is_finished(),
+            "second send should wait while UDP channel is full"
+        );
+
+        let (payload, observed_local, observed_remote) =
+            udp_read.next().await.expect("first udp packet");
+        assert_eq!(payload, b"first");
+        assert_eq!(observed_local, local);
+        assert_eq!(observed_remote, remote);
+
+        timeout(Duration::from_secs(1), second_send)
+            .await
+            .expect("second send should be woken after capacity returns")
+            .expect("second send task")
+            .expect("second packet");
+
+        let (payload, observed_local, observed_remote) =
+            udp_read.next().await.expect("second udp packet");
+        assert_eq!(payload, b"second");
+        assert_eq!(observed_local, local);
+        assert_eq!(observed_remote, remote);
+    }
+
+    fn udp_ipv4_packet(local: SocketAddr, remote: SocketAddr, payload: &[u8]) -> Vec<u8> {
+        let (SocketAddr::V4(local), SocketAddr::V4(remote)) = (local, remote) else {
+            unreachable!("test uses IPv4 only");
+        };
+        let builder = PacketBuilder::ipv4(local.ip().octets(), remote.ip().octets(), 20)
+            .udp(local.port(), remote.port());
+        let mut packet = Vec::with_capacity(builder.size(payload.len()));
+        builder.write(&mut packet, payload).expect("udp packet");
+        packet
+    }
 }
